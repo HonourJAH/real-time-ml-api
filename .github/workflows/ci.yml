@@ -1,9 +1,119 @@
+
 name: CI
+
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
+
 jobs:
-  build:
+  test:
+    name: Unit tests
     runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run tests
+        run: pytest -v
+
+  docker-smoke-test:
+    name: Docker build + full end-to-end smoke test
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t real-time-ml-api:ci .
+
+      - name: Start container
+        run: docker run -d --name real-time-ml-api-ci -p 8000:8000 real-time-ml-api:ci
+
+      - name: Wait for container to respond
+        run: |
+          for i in $(seq 1 15); do
+            if curl -sf http://localhost:8000/health; then
+              echo ""
+              echo "Container is up"
+              exit 0
+            fi
+            echo "Waiting for container... (attempt $i/15)"
+            sleep 2
+          done
+          echo "Container did not respond within the timeout window"
+          exit 1
+
+      - name: Confirm model is untrained before /train
+        run: |
+          curl -sf http://localhost:8000/health | tee /dev/stderr | grep -q '"model_trained":false'
+
+      - name: Train the model
+        run: |
+          curl -sf -X POST http://localhost:8000/train \
+            -H "Content-Type: application/json" \
+            -d '{"n_samples": 2000, "anomaly_rate": 0.05}'
+
+      - name: Confirm model is trained after /train
+        run: |
+          curl -sf http://localhost:8000/health | tee /dev/stderr | grep -q '"model_trained":true'
+
+      - name: WebSocket smoke test — score a normal and an anomalous event
+        run: |
+          pip install websockets
+          python3 - <<'EOF'
+          import asyncio
+          import json
+          from websockets.asyncio.client import connect
+
+          NORMAL = {"amount": 30.0, "hour": 13, "merchant_category": 2,
+                    "distance_from_home_km": 3.0, "velocity_last_hour": 1}
+          ANOMALOUS = {"amount": 4000.0, "hour": 3, "merchant_category": 8,
+                       "distance_from_home_km": 2500.0, "velocity_last_hour": 18}
+
+          async def main():
+              async with connect("ws://localhost:8000/ws/stream") as ws:
+                  await ws.send(json.dumps(NORMAL))
+                  normal_resp = json.loads(await ws.recv())
+                  assert normal_resp["is_anomaly"] is False, f"normal event wrongly flagged: {normal_resp}"
+
+                  await ws.send(json.dumps(ANOMALOUS))
+                  anomalous_resp = json.loads(await ws.recv())
+                  assert anomalous_resp["is_anomaly"] is True, f"anomalous event not flagged: {anomalous_resp}"
+
+                  print("WebSocket smoke test passed:")
+                  print("  normal:", normal_resp)
+                  print("  anomalous:", anomalous_resp)
+
+          asyncio.run(main())
+          EOF
+
+      - name: Dump container logs on failure
+        if: failure()
+        run: docker logs real-time-ml-api-ci
+
+      - name: Tear down
+        if: always()
+        run: docker rm -f real-time-ml-api-ci || true
